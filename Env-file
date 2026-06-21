@@ -1,0 +1,9 @@
+AWS_REGION=us-east-1
+
+AWS_ACCESS_KEY_ID=xxxxxxxxxxxxxx
+AWS_SECRET_ACCESS_KEY=xxxxxxxxxxx
+
+# ================= RABBITMQ =================
+RABBITMQ_URL=
+RABBITMQ_REQUEST_QUEUE=
+RABBITMQ_RESPONSE_QUEUE=
