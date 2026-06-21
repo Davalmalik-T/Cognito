@@ -1,0 +1,713 @@
+package main
+
+import (
+    "context"
+    "crypto/rand"
+    "encoding/json"
+    "fmt"
+    "log"
+    "math/big"
+    "os"
+    "strings"
+    "time"
+    "net/http"
+
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+
+    "github.com/joho/godotenv"
+    amqp "github.com/rabbitmq/amqp091-go"
+
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/config"
+    cognito "github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+    "github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider/types"
+)
+
+func init() {
+    godotenv.Load()
+}
+
+//
+// ================= CONFIG =================
+//
+
+type Config struct {
+    AWSRegion string
+    RabbitURL string
+    ReqQueue  string
+    ResQueue  string
+}
+
+func mustEnv(key string) string {
+    v := strings.TrimSpace(os.Getenv(key))
+    if v == "" {
+        log.Fatalf("❌ Missing env: %s", key)
+    }
+    return v
+}
+
+func loadConfig() Config {
+    return Config{
+        AWSRegion: mustEnv("AWS_REGION"),
+        RabbitURL: mustEnv("RABBITMQ_URL"),
+        ReqQueue:  mustEnv("RABBITMQ_REQUEST_QUEUE"),
+        ResQueue:  mustEnv("RABBITMQ_RESPONSE_QUEUE"),
+    }
+}
+
+//
+// ================= TYPES =================
+//
+
+type UserInput struct {
+    Username string `json:"username"`
+    Email    string `json:"email"`
+}
+
+type Event struct {
+    Action      string      `json:"action"`
+    Environment string      `json:"env"`
+    CompanyCode string      `json:"companyCode"`
+    Client      string      `json:"client"`
+    Domain      string      `json:"domain"`
+    Username    string      `json:"username"`
+    Users       []UserInput `json:"users"`
+    Usernames   []string    `json:"usernames"`
+    Email       string      `json:"email"`
+    CallbackURLs []string `json:"callbackUrls"`
+    LogoutURLs   []string `json:"logoutUrls"`
+    DefaultRedirectURL string `json:"defaultRedirectUrl"`
+
+    M2MClient string   `json:"m2mClient"`
+    Scopes    []string `json:"scopes"`
+}
+
+type UserResult struct {
+    Username string `json:"username"`
+    Status   string `json:"status"`
+    Message  string `json:"message"`
+}
+
+type Response struct {
+    Status    string       `json:"status"`
+    Message   string       `json:"message"`
+    UserPool  string       `json:"userPool,omitempty"`
+    ClientId    string `json:"clientId,omitempty"`
+    M2MClientId string `json:"m2mClientId,omitempty"`
+    Results   []UserResult `json:"results,omitempty"`
+    Timestamp string       `json:"timestamp"`
+}
+
+//
+// ================= MAIN =================
+//
+
+func main() {
+
+    cfg := loadConfig()
+
+    ctx := context.Background()
+
+    awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
+    if err != nil {
+        log.Fatalf("❌ AWS config error: %v", err)
+    }
+
+    client := cognito.NewFromConfig(awsCfg)
+
+    
+    go func() {
+        http.Handle("/metrics", promhttp.Handler())
+        log.Println("📊 Metrics server running on :2112")
+        if err := http.ListenAndServe(":2112", nil); err != nil {
+            log.Println("Metrics server error:", err)
+        }
+    }()
+
+
+    for {
+
+        log.Println("🔄 Connecting to RabbitMQ...")
+
+        conn, ch, err := connectRabbitWithRetry(cfg.RabbitURL)
+        if err != nil {
+            log.Println("❌ RabbitMQ failed:", err)
+            time.Sleep(10 * time.Second)
+            continue
+        }
+
+        log.Println("✅ RabbitMQ connected")
+
+        _, err = ch.QueueDeclare(cfg.ReqQueue, true, false, false, false, nil)
+        if err != nil {
+            log.Println("❌ Queue error:", err)
+            conn.Close()   
+            continue
+        }
+
+        _, err = ch.QueueDeclare(cfg.ResQueue, true, false, false, false, nil)
+        if err != nil {
+            log.Println("❌ Queue error:", err)
+            conn.Close()   
+            continue
+        }
+
+        msgs, err := ch.Consume(cfg.ReqQueue, "", false, false, false, false, nil)
+        if err != nil {
+            log.Println("❌ Consume error:", err)
+            conn.Close()
+            continue
+        }
+
+        log.Println("📥 Listening...")
+
+        for msg := range msgs {
+            processMessage(ctx, client, ch, cfg.ResQueue, msg)
+        }
+
+        log.Println("⚠️ Connection lost. Reconnecting...")
+        conn.Close()
+    }
+}
+
+//
+// ================= PROCESS =================
+//
+
+func processMessage(ctx context.Context, client *cognito.Client, ch *amqp.Channel, respQueue string, msg amqp.Delivery) {
+
+    log.Println("📩 Message received:", string(msg.Body))
+
+    var e Event
+    if err := json.Unmarshal(msg.Body, &e); err != nil {
+        log.Println("❌ Invalid JSON")
+        publish(ch, respQueue, fail("invalid json"))
+        msg.Ack(false)   // ✅ ACK even for bad message to avoid retry loop
+        return
+    }
+
+    log.Printf("⚙ Action: %s | Company: %s", e.Action, e.CompanyCode)
+
+    poolName := fmt.Sprintf("%s-%s", e.Environment, e.CompanyCode)
+
+    var poolID string
+    var err error
+
+    if e.Action != "COGNITO_CREATE" {
+        log.Println("🔍 Fetching UserPool:", poolName)
+
+        poolID, err = getPoolID(ctx, client, poolName)
+        if err != nil {
+            log.Println("❌ Pool not found:", err)
+            publish(ch, respQueue, fail(err.Error()))
+            msg.Ack(false)
+            return
+        }
+
+        log.Println("✅ UserPool found:", poolID)
+    }
+
+    var resp Response
+
+    switch e.Action {
+
+    case "COGNITO_CREATE":
+    
+    var result string
+    result, err = handleSetup(ctx, client, e)
+
+    parts := strings.Split(result, "|")
+
+    if len(parts) > 0 {
+        poolID = parts[0]
+    }
+
+    if len(parts) > 1 {
+        resp.ClientId = parts[1]
+    }
+
+    if len(parts) > 2 {
+        resp.M2MClientId = parts[2]
+    }
+
+    resp.Status = "SUCCESS"
+    resp.Message = "Cognito setup completed successfully"
+
+    case "USER_CREATE":
+        resp, err = handleCreateUsers(ctx, client, poolID, e)
+
+    case "USER_DELETE":
+        resp, err = handleDeleteUsers(ctx, client, poolID, e)
+
+    case "USER_DISABLE":
+        resp, err = handleDisableUsers(ctx, client, poolID, e)
+
+    default:
+        log.Println("❌ Unknown action")
+        resp = fail("unknown action")
+    }
+
+    if err != nil {
+        log.Println("❌ Action error:", err)
+        resp = fail(err.Error())
+    }
+
+    resp.Timestamp = time.Now().Format(time.RFC3339)
+    resp.UserPool = poolID
+
+    publish(ch, respQueue, resp)
+
+    log.Println("✅ Response published")
+
+    msg.Ack(false)   // ✅ ACK only AFTER successful processing
+}
+
+//
+// ================= SETUP =================
+//
+
+func handleSetup(ctx context.Context, client *cognito.Client, e Event) (string, error) {
+
+    poolName := fmt.Sprintf("%s-%s", e.Environment, e.CompanyCode)
+
+    log.Println("🆕 Creating UserPool:", poolName)
+
+    pool, err := client.CreateUserPool(ctx, &cognito.CreateUserPoolInput{
+        PoolName: aws.String(poolName),
+    })
+    if err != nil {
+        return "", err
+    }
+
+    poolID := *pool.UserPool.Id
+    log.Println("✅ UserPool Created:", poolID)
+
+    log.Println("🔧 Creating Web App Client:", e.Client)
+
+// ✅ fallback handling
+callbackURLs := e.CallbackURLs
+logoutURLs   := e.LogoutURLs
+
+if len(callbackURLs) == 0 {
+    callbackURLs = []string{"http://localhost:3000/callback"}
+}
+if len(logoutURLs) == 0 {
+    logoutURLs = []string{"http://localhost:3000/logout"}
+}
+
+
+// ✅ Default redirect logic
+defaultRedirect := e.DefaultRedirectURL
+if defaultRedirect == "" {
+    defaultRedirect = callbackURLs[0]
+}
+
+appClientResp, err := client.CreateUserPoolClient(ctx, &cognito.CreateUserPoolClientInput{
+    ClientName: aws.String(e.Client),
+    UserPoolId: aws.String(poolID),
+
+    AccessTokenValidity:  aws.Int32(30),
+    IdTokenValidity:      aws.Int32(30),
+    RefreshTokenValidity: 1,
+
+    TokenValidityUnits: &types.TokenValidityUnitsType{
+        AccessToken:  types.TimeUnitsTypeMinutes,
+        IdToken:      types.TimeUnitsTypeMinutes,
+        RefreshToken: types.TimeUnitsTypeDays,
+    },
+
+    CallbackURLs: callbackURLs,
+    LogoutURLs:   logoutURLs,
+
+    DefaultRedirectURI: aws.String(defaultRedirect),   
+
+    AllowedOAuthFlows: []types.OAuthFlowType{
+        types.OAuthFlowTypeCode,
+    },
+
+    AllowedOAuthScopes: []string{
+        "openid",
+        "email",
+        "profile",
+    },
+
+    AllowedOAuthFlowsUserPoolClient: true,
+
+    SupportedIdentityProviders: []string{
+    "COGNITO",
+    },
+})
+    webClientID := ""
+
+    if err == nil && appClientResp.UserPoolClient != nil {
+        webClientID = *appClientResp.UserPoolClient.ClientId
+    }
+
+    if err != nil {
+        log.Println("⚠️ App client error:", err)
+    }
+
+    m2mClientID := ""
+
+    if e.M2MClient != "" {
+        log.Println("🔐 Creating M2M Client:", e.M2MClient)
+        m2mClientID, _ = createM2MResourcesWithScopes(ctx, client, poolID, e)
+    }
+
+    log.Println("🌐 Creating Domain:", e.Domain)
+    _, err = client.CreateUserPoolDomain(ctx, &cognito.CreateUserPoolDomainInput{
+        Domain:     aws.String(e.Domain),
+        UserPoolId: aws.String(poolID),
+    })
+    if err != nil {
+        log.Println("⚠️ Domain error:", err)
+    }
+
+    log.Println("👤 Creating Admin User:", e.Username)
+    err = createUserWithRetry(ctx, client, poolID, e.Username, e.Email)
+    if err != nil {
+        log.Println("❌ Admin user failed:", err)
+    }
+
+    log.Println("✅ Setup completed")
+
+    return fmt.Sprintf("%s|%s|%s", poolID, webClientID, m2mClientID), nil
+}
+
+//
+// ================= USER OPS =================
+//
+
+func handleCreateUsers(ctx context.Context, client *cognito.Client, poolID string, e Event) (Response, error) {
+
+    log.Println("👥 Creating users batch...")
+
+    var results []UserResult
+
+    for _, u := range e.Users {
+
+        log.Println("➡ Creating user:", u.Username)
+
+        err := createUserWithRetry(ctx, client, poolID, u.Username, u.Email)
+
+        if err != nil {
+            log.Println("❌ Failed:", u.Username)
+            results = append(results, UserResult{u.Username, "FAILED", err.Error()})
+        } else {
+            log.Println("✅ Created:", u.Username)
+            results = append(results, UserResult{u.Username, "CREATED", "success"})
+        }
+    }
+
+    log.Println("✅ User creation batch completed")
+
+    return buildResult(poolID, results), nil
+}
+
+func handleDeleteUsers(ctx context.Context, client *cognito.Client, poolID string, e Event) (Response, error) {
+
+    log.Println("🗑 Deleting users...")
+
+    var results []UserResult
+
+    for _, u := range e.Usernames {
+
+        log.Println("➡ Deleting:", u)
+
+        err := retryDeleteUser(ctx, client, poolID, u)
+
+        if err != nil {
+            results = append(results, UserResult{u, "FAILED", err.Error()})
+        } else {
+            results = append(results, UserResult{u, "DELETED", "success"})
+        }
+    }
+
+    log.Println("✅ Deletion completed")
+
+    return buildResult(poolID, results), nil
+}
+
+func handleDisableUsers(ctx context.Context, client *cognito.Client, poolID string, e Event) (Response, error) {
+
+    log.Println("🚫 Disabling users...")
+
+    var results []UserResult
+
+    for _, u := range e.Usernames {
+
+        log.Println("➡ Disabling:", u)
+
+        _, err := client.AdminDisableUser(ctx, &cognito.AdminDisableUserInput{
+            UserPoolId: aws.String(poolID),
+            Username:   aws.String(u),
+        })
+
+        if err != nil {
+            results = append(results, UserResult{u, "FAILED", err.Error()})
+        } else {
+            results = append(results, UserResult{u, "DISABLED", "success"})
+        }
+    }
+
+    log.Println("✅ Disable completed")
+
+    return buildResult(poolID, results), nil
+}
+
+//
+// ================= M2M =================
+//
+
+func createM2MResourcesWithScopes(ctx context.Context, client *cognito.Client, poolID string, e Event) (string, error) {
+
+    identifier := fmt.Sprintf("%s-api", e.CompanyCode)
+
+    log.Println("🔐 Creating Resource Server:", identifier)
+
+    var scopes []types.ResourceServerScopeType
+    for _, s := range e.Scopes {
+        scopes = append(scopes, types.ResourceServerScopeType{
+            ScopeName:        aws.String(s),
+            ScopeDescription: aws.String(s),
+        })
+    }
+
+    _, err := client.CreateResourceServer(ctx, &cognito.CreateResourceServerInput{
+        Identifier: aws.String(identifier),
+        Name:       aws.String(identifier),
+        UserPoolId: aws.String(poolID),
+        Scopes:     scopes,
+    })
+
+    if err != nil {
+        log.Println("❌ Resource server error:", err)
+    } else {
+        log.Println("✅ Resource server created")
+    }
+
+    var fullScopes []string
+    for _, s := range e.Scopes {
+        fullScopes = append(fullScopes, fmt.Sprintf("%s/%s", identifier, s))
+    }
+
+    log.Println("🔐 Creating M2M App Client")
+
+    m2mResp, err := client.CreateUserPoolClient(ctx, &cognito.CreateUserPoolClientInput{
+    ClientName: aws.String(e.M2MClient),
+    UserPoolId: aws.String(poolID),
+    GenerateSecret: true,
+
+    AllowedOAuthFlows: []types.OAuthFlowType{
+        types.OAuthFlowTypeClientCredentials,
+    },
+    AllowedOAuthScopes: fullScopes,
+    AllowedOAuthFlowsUserPoolClient: true,
+
+    AccessTokenValidity: aws.Int32(30),
+    IdTokenValidity:     aws.Int32(30),
+    RefreshTokenValidity: 1,
+
+    TokenValidityUnits: &types.TokenValidityUnitsType{
+        AccessToken:  types.TimeUnitsTypeMinutes,
+        IdToken:      types.TimeUnitsTypeMinutes,
+        RefreshToken: types.TimeUnitsTypeDays,
+    },
+})
+    m2mClientID := ""
+
+    if err == nil && m2mResp.UserPoolClient != nil {
+        m2mClientID = *m2mResp.UserPoolClient.ClientId
+    }
+
+    if err != nil {
+        log.Println("❌ M2M creation failed:", err)
+    } else {
+        log.Println("✅ M2M client created")
+    }
+
+    return m2mClientID, err
+}
+
+//
+// ================= HELPERS =================
+//
+
+func connectRabbitWithRetry(url string) (*amqp.Connection, *amqp.Channel, error) {
+
+    for i := 1; i <= 3; i++ {
+        log.Printf("🔁 Attempt %d...", i)
+
+        var conn *amqp.Connection
+        var err error
+
+        if strings.HasPrefix(url, "amqps://") {
+            conn, err = amqp.DialTLS(url, nil)
+        } else {
+            conn, err = amqp.Dial(url)
+        }
+
+        if err == nil {
+            ch, chErr := conn.Channel()
+            if chErr == nil {
+                return conn, ch, nil
+            }
+            conn.Close()
+        }
+
+        time.Sleep(5 * time.Second)
+    }
+
+    return nil, nil, fmt.Errorf("failed to connect to RabbitMQ")
+}
+
+func getPoolID(ctx context.Context, client *cognito.Client, name string) (string, error) {
+
+    var token *string
+
+    for {
+        out, err := client.ListUserPools(ctx, &cognito.ListUserPoolsInput{
+            MaxResults: aws.Int32(60),
+            NextToken:  token,
+        })
+        if err != nil {
+            return "", err
+        }
+
+        for _, p := range out.UserPools {
+            if strings.EqualFold(*p.Name, name) {
+                return *p.Id, nil
+            }
+        }
+
+        if out.NextToken == nil {
+            break
+        }
+        token = out.NextToken
+    }
+
+    return "", fmt.Errorf("pool not found: %s", name)
+}
+
+func retryDeleteUser(ctx context.Context, client *cognito.Client, poolID, user string) error {
+
+    for i := 1; i <= 3; i++ {
+        log.Printf("🔁 Delete attempt %d: %s", i, user)
+
+        _, err := client.AdminDeleteUser(ctx, &cognito.AdminDeleteUserInput{
+            UserPoolId: aws.String(poolID),
+            Username:   aws.String(user),
+        })
+        if err == nil {
+            return nil
+        }
+        time.Sleep(2 * time.Second)
+    }
+
+    return fmt.Errorf("delete failed")
+}
+
+func createUserWithRetry(ctx context.Context, client *cognito.Client, poolID, user, email string) error {
+
+    for i := 1; i <= 3; i++ {
+        log.Printf("🔁 Create attempt %d: %s", i, user)
+
+        err := createUser(ctx, client, poolID, user, email)
+        if err == nil {
+            return nil
+        }
+        time.Sleep(2 * time.Second)
+    }
+
+    return fmt.Errorf("user create failed")
+}
+
+func createUser(ctx context.Context, client *cognito.Client, poolID, user, email string) error {
+
+    pass := genPass(12)
+
+    _, err := client.AdminCreateUser(ctx, &cognito.AdminCreateUserInput{
+        UserPoolId:        aws.String(poolID),
+        Username:          aws.String(user),
+        TemporaryPassword: aws.String(pass),
+        MessageAction:     types.MessageActionTypeSuppress,
+        UserAttributes: []types.AttributeType{
+            {Name: aws.String("email"), Value: aws.String(email)},
+            {Name: aws.String("email_verified"), Value: aws.String("true")},
+        },
+    })
+    if err != nil {
+        return err
+    }
+
+    _, err = client.AdminSetUserPassword(ctx, &cognito.AdminSetUserPasswordInput{
+        UserPoolId: aws.String(poolID),
+        Username:   aws.String(user),
+        Password:   aws.String(pass),
+        Permanent:  true,
+    })
+
+    return err
+}
+
+func genPass(n int) string {
+    charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+    b := make([]byte, n)
+    for i := range b {
+        b[i] = charset[randIndex(len(charset))]
+    }
+    return string(b)
+}
+
+func randIndex(max int) int {
+    n, _ := rand.Int(rand.Reader, big.NewInt(int64(max)))
+    return int(n.Int64())
+}
+
+func publish(ch *amqp.Channel, q string, r Response) {
+    log.Println("📤 Publishing to queue:", q)
+
+    body, _ := json.Marshal(r)
+    err := ch.Publish("", q, false, false, amqp.Publishing{
+        ContentType: "application/json",
+        Body:        body,
+    })
+
+    if err != nil {
+        log.Println("❌ Publish failed:", err)
+    } else {
+        log.Println("✅ Publish successful")
+    }
+}
+
+func fail(msg string) Response {
+    return Response{Status: "FAILED", Message: msg}
+}
+
+func buildResult(pool string, results []UserResult) Response {
+
+    var ok, failCount int
+
+    for _, r := range results {
+        if r.Status == "FAILED" {
+            failCount++
+        } else {
+            ok++
+        }
+    }
+
+    status := "SUCCESS"
+    if failCount > 0 && ok > 0 {
+        status = "PARTIAL_SUCCESS"
+    } else if failCount > 0 {
+        status = "FAILED"
+    }
+
+    return Response{
+        Status:    status,
+        Message:   fmt.Sprintf("success=%d failed=%d", ok, failCount),
+        UserPool:  pool,
+        Results:   results,
+        Timestamp: time.Now().Format(time.RFC3339),
+    }
+}
