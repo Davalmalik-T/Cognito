@@ -1,0 +1,750 @@
+Production-ready service
+
+This page documents the Cognito Worker Service architecture, message contract, deployment model, runtime behavior, monitoring setup, and current production considerations.
+
+At a glance
+
+Runtime: Go worker running on Kubernetes
+
+Input queue: cognito-request
+
+Output queue: cognito-response
+
+Primary dependency: AWS Cognito
+
+Metrics endpoint: /metrics on port 2112
+
+Transport: RabbitMQ over amqps:// for production
+
+AWS access model
+
+The worker uses one dedicated IAM user for AWS authentication.
+
+IAM username: cognito_user
+
+The Kubernetes Secret stores the access key and secret key for cognito_user as AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+
+The IAM user must have a proper least-privilege policy that allows only the required AWS Cognito operations.
+
+Overview
+Purpose and responsibilities
+Architecture
+Application behavior
+Startup flow
+Protocol handling
+RabbitMQ behavior
+Supported actions
+Cognito setup and OAuth configuration
+OAuth configuration
+Dynamic redirect configuration
+Fallback logic
+Hosted UI
+Admin user behavior
+Event contract
+Batch user creation event
+User access disable event
+User deletion event
+Environment configuration
+Kubernetes deployment
+Monitoring and observability
+Health model
+Resilience characteristics
+Deployment procedure
+Operational status
+Source code
+Summary
+FAQ
+Overview
+The Cognito Worker Service is a Go-based, event-driven microservice that automates Cognito provisioning and user lifecycle operations in an asynchronous workflow. It sits between producer systems and downstream consumers, taking requests from RabbitMQ, executing Cognito actions in AWS, and publishing result messages back to RabbitMQ.
+
+This design helps decouple provisioning requests from execution, improves resilience during transient failures, and provides operational visibility through Prometheus-compatible metrics.
+
+Purpose and responsibilities
+The service acts as a backend worker for Cognito-related automation.
+
+Consumes provisioning and user-management requests from cognito-request
+
+Executes Cognito setup and user operations in AWS
+
+Publishes processing outcomes to cognito-response
+
+Applies OAuth callback, logout, and redirect configuration dynamically
+
+Exposes runtime metrics for monitoring and alerting
+
+Architecture
+High-level flow
+
+Producer systems submit action messages to RabbitMQ. The worker consumes each message, routes it to the correct Cognito operation, performs the AWS action, and publishes a response for downstream consumers.
+
+
+
+Producer System
+  |
+  v
+RabbitMQ Queue (cognito-request)
+  |
+  v
+Go Consumer (Kubernetes Pod)
+  |
+  v
+Action Router
+  |-- Cognito Setup
+  |-- User Create
+  |-- User Delete
+  |-- User Disable
+  |
+  v
+AWS Cognito
+  |
+  v
+RabbitMQ Queue (cognito-response)
+  |
+  v
+Consumer Systems
+Component
+
+Role
+
+Producer System
+
+Sends action-based provisioning or user-management requests
+
+RabbitMQ Request Queue
+
+Buffers inbound work on cognito-request
+
+Cognito Worker
+
+Consumes, validates, routes, processes, and responds
+
+AWS Cognito
+
+Executes identity, user pool, client, and user operations
+
+RabbitMQ Response Queue
+
+Returns results on cognito-response
+
+Application behavior
+Startup flow
+Load required environment variables
+
+Initialize AWS SDK and Cognito clients
+
+Start the metrics server on :2112
+
+Enter the RabbitMQ consumer loop and process messages continuously
+
+Protocol handling
+Environment
+
+Protocol
+
+Expected usage
+
+Local
+
+amqp://
+
+Local or non-TLS development scenarios
+
+AWS MQ / managed environments
+
+amqps://
+
+TLS-secured production connectivity
+
+RabbitMQ behavior
+Durable queues are used for persistence
+
+Manual acknowledgment happens only after successful processing
+
+Failed processing supports retry up to 3 attempts
+
+Connection recovery is handled through an automatic reconnect loop
+
+Operational note
+
+Manual ACK combined with retry and reconnect logic reduces the chance of message loss during broker interruptions and transient failures.
+
+Supported actions
+Action
+
+Description
+
+COGNITO_CREATE
+
+Performs full Cognito provisioning, including OAuth-related setup
+
+USER_CREATE
+
+Creates users in batch
+
+USER_DELETE
+
+Deletes one or more users
+
+USER_DISABLE
+
+Disables one or more users
+
+Cognito setup and OAuth configuration
+OAuth configuration
+Authorization flow: Authorization Code
+
+Identity provider: COGNITO
+
+Standard scopes: openid, email, profile
+
+Dynamic redirect configuration
+Configuration item
+
+Payload field
+
+Callback URLs
+
+callbackUrls
+
+Logout URLs
+
+logoutUrls
+
+Default redirect URL
+
+defaultRedirectUrl
+
+Fallback logic
+callbackUrls → default: http://localhost:3000/callback
+
+logoutUrls → default: http://localhost:3000/logout
+
+defaultRedirect → callbackUrls[0]
+
+Hosted UI
+The Cognito Hosted UI login endpoint follows this pattern:
+
+https://<domain>.auth.<region>.amazoncognito.com/login
+
+The Cognito Hosted UI forgot password endpoint follows this pattern:
+
+https://<domain>.auth.<region>.amazoncognito.com/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+email+profile&redirect_uri=<callback-url>
+
+If the application uses its own custom login page instead of the Cognito Hosted UI login page, the forgot password page should be handled by the application frontend using the same query-parameter pattern. The recommended custom forgot password URL pattern is:
+
+https://<your-app-domain>/forgot-password?client_id=<app-client-id>&response_type=code&scope=openid+email+profile&redirect_uri=https://<your-app-domain>/callback
+
+The custom forgot password page should collect the user email or username and call Cognito forgot password/reset password APIs, while using the configured callback or application route for the final redirect after reset.
+
+Admin user behavior
+Email is marked as verified
+
+The code sets the admin user password permanently during creation. After that, the admin user can reset the password later by using the Cognito forgot password/reset password flow.
+
+Admin-user creation is retry-enabled
+
+Current state
+
+OAuth flow, callback URLs, logout URLs, and default redirect handling are fully configured and working in the current design.
+
+Event contract
+The primary provisioning event is COGNITO_CREATE. Producer systems send a JSON message describing the target environment, naming, hosted UI domain, admin user, redirect behavior, and optional machine-to-machine configuration.
+
+
+
+{
+  "action": "COGNITO_CREATE",
+  "env": "dev",
+  "companyCode": "acme",
+  "client": "acme-web-client",
+  "domain": "acme-dev-auth",
+  "username": "admin",
+  "email": "admin@acme.com",
+  "callbackUrls": ["https://app.acme.com/callback"],
+  "logoutUrls": ["https://app.acme.com/logout"],
+  "defaultRedirectUrl": "https://app.acme.com/callback",
+  "m2mClient": "acme-m2m-client",
+  "scopes": ["read", "write"]
+}
+Field
+
+Purpose
+
+action
+
+Determines which worker operation to execute
+
+env
+
+Identifies the target environment
+
+companyCode
+
+Business or tenant identifier
+
+client
+
+Name of the Cognito application client
+
+domain
+
+Cognito hosted UI domain prefix
+
+username
+
+Administrative username to create or manage
+
+email
+
+Administrative email address
+
+callbackUrls
+
+OAuth callback destinations
+
+logoutUrls
+
+OAuth logout destinations
+
+defaultRedirectUrl
+
+Default post-authentication redirect
+
+m2mClient
+
+Optional machine-to-machine client name
+
+scopes
+
+Custom scopes for M2M or API access
+
+Batch user creation event
+Use USER_CREATE to create multiple Cognito users in one request. Producer systems send a JSON message with env and companyCode; the worker maps these values to the correct Cognito user pool. 
+
+
+
+{
+  "action": "USER_CREATE",
+  "env": "dev",
+  "companyCode": "acme",
+  "users": [
+    {
+      "username": "user1",
+      "email": "user1@acme.com"
+    },
+    {
+      "username": "user2",
+      "email": "user2@acme.com"
+    }
+  ]
+}
+Field
+
+Purpose
+
+action
+
+Must be USER_CREATE for batch user creation
+
+env
+
+Identifies the target environment and is used with companyCode to resolve the Cognito user pool
+
+companyCode
+
+Business or tenant identifier used with env to resolve the Cognito user pool
+
+users
+
+Array of users to create in batch
+
+username
+
+Username for the Cognito user
+
+email
+
+Email address assigned to the user. This field is required for user communication and for the Cognito forgot password/reset password flow after the code has set the user's password permanently.
+
+User access disable event
+Use USER_DISABLE to disable access for one or more existing Cognito users without deleting the accounts. The payload does not require userPoolId; the worker resolves the target user pool from env and companyCode.
+
+
+
+{
+  "action": "USER_DISABLE",
+  "env": "dev",
+  "companyCode": "acme",
+  "usernames": [
+    "user1",
+    "user2"
+  ]
+}
+Field
+
+Purpose
+
+action
+
+Must be USER_DISABLE for access disable requests
+
+env
+
+Identifies the target environment and is used with companyCode to resolve the Cognito user pool
+
+companyCode
+
+Business or tenant identifier used with env to resolve the Cognito user pool
+
+usernames
+
+Array of usernames whose access should be disabled
+
+reason
+
+Optional operational reason for audit or downstream response handling
+
+User deletion event
+Use USER_DELETE to permanently delete one or more users. The payload does not require userPoolId; the worker resolves the target user pool from env and companyCode.
+
+
+
+{
+  "action": "USER_DELETE",
+  "env": "dev",
+  "companyCode": "acme",
+  "usernames": [
+    "user1",
+    "user2"
+  ]
+}
+Field
+
+Purpose
+
+action
+
+Must be USER_DELETE for user deletion requests
+
+env
+
+Identifies the target environment and is used with companyCode to resolve the Cognito user pool
+
+companyCode
+
+Business or tenant identifier used with env to resolve the Cognito user pool
+
+usernames
+
+Array of usernames to delete
+
+reason
+
+Optional operational reason for audit or downstream response handling
+
+Lifecycle operation note
+
+USER_DISABLE is reversible because the Cognito user remains in the user pool. USER_DELETE is destructive and should be used only when permanent account removal is intended.
+
+Environment configuration
+The service depends on environment variables for AWS connectivity, queue names, and RabbitMQ access.
+
+
+
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=<access-key-for-cognito_user>
+AWS_SECRET_ACCESS_KEY=<secret-key-for-cognito_user>
+RABBITMQ_URL=amqps://user:password@host:5671/KCP_Dev_vhost
+RABBITMQ_REQUEST_QUEUE=cognito-request
+RABBITMQ_RESPONSE_QUEUE=cognito-response
+Required broker and AWS access settings
+
+TLS must be enabled for production use, valid RabbitMQ credentials must be supplied, and the RabbitMQ virtual host must be present in the connection URL, for example KCP_Dev_vhost.
+
+AWS credentials must belong to IAM user cognito_user. This user should have a proper least-privilege IAM policy for the required Cognito operations only.
+
+Kubernetes deployment
+The service is deployed as a single-replica worker pod. Configuration is split between a ConfigMap and a Secret. Metrics are exposed through a Service and scraped by Prometheus through a ServiceMonitor.
+
+Resource
+
+Name
+
+Purpose
+
+Key details
+
+Namespace
+
+shared-dev-n
+
+Logical isolation for runtime resources
+
+Hosts worker-related Kubernetes objects
+
+ConfigMap
+
+cognito-config
+
+Non-secret runtime configuration
+
+Region and queue names
+
+Secret
+
+cognito-secret
+
+Sensitive configuration
+
+AWS credentials for cognitouser and RabbitMQ URL
+
+Deployment
+
+cognito-worker
+
+Runs the worker container
+
+Image, probes, resources, and environment injection
+
+Service
+
+cognito-worker
+
+Exposes metrics internally
+
+Port 2112 mapped to container metrics port
+
+ServiceMonitor
+
+cognito-worker
+
+Prometheus discovery
+
+Scrapes /metrics every 15s
+
+
+Kubernetes manifests
+Namespace
+
+
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shared-dev-n
+ConfigMap
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cognito-config
+  namespace: shared-dev-n
+data:
+  AWS_REGION: "us-east-1"
+  RABBITMQ_REQUEST_QUEUE: "cognito-request"
+  RABBITMQ_RESPONSE_QUEUE: "cognito-response"
+Secret
+
+
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cognito-secret
+  namespace: shared-dev-n
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "<access-key-for-cognito_user>"
+  AWS_SECRET_ACCESS_KEY: "<secret-key-for-cognito_user>"
+  RABBITMQ_URL: "amqps://user:password@host:5671/KCP_Dev_vhost"
+Deployment
+
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cognito-worker
+  namespace: shared-dev-n
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cognito-worker
+  template:
+    metadata:
+      labels:
+        app: cognito-worker
+    spec:
+      imagePullSecrets:
+        - name: ucbosregistry
+      containers:
+        - name: cognito-worker
+          image: <custom_image built using go code>
+          ports:
+            - containerPort: 2112
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: cognito-config
+            - secretRef:
+                name: cognito-secret
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 2112
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 2112
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      restartPolicy: Always
+Service
+
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: cognito-worker
+  namespace: shared-dev-n
+spec:
+  selector:
+    app: cognito-worker
+  ports:
+    - name: metrics
+      port: 2112
+      targetPort: 2112
+ServiceMonitor
+
+
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cognito-worker
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: cognito-worker
+  namespaceSelector:
+    matchNames:
+      - shared-dev-n
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+Monitoring and observability
+The worker exposes a Prometheus-compatible endpoint at /metrics. This provides visibility into runtime health and resource usage.
+
+CPU metrics
+
+Memory metrics
+
+Goroutine counts
+
+Garbage collection metrics
+
+Health model
+Kubernetes liveness and readiness probes both target /metrics on port 2112. In this model, metrics endpoint availability is treated as part of service health.
+
+Resilience characteristics
+Component
+
+Behavior
+
+RabbitMQ connectivity
+
+Retry with automatic reconnect loop
+
+AWS calls
+
+Retry-enabled for transient failures
+
+Worker process
+
+Runs in an infinite processing loop
+
+This model is intended to keep the service available during temporary broker interruptions, intermittent network issues, and some AWS-side transient errors.
+
+Deployment procedure
+
+
+kubectl apply -f namespace.yaml
+kubectl apply -f configmap.yaml
+kubectl apply -f secret.yaml
+kubectl apply -f deployment.yaml
+kubectl apply -f service.yaml
+kubectl apply -f servicemonitor.yaml
+Operational status
+Production-ready
+ Core architecture, OAuth handling, and broker connectivity are in place
+
+Resolved
+ TLS connectivity for RabbitMQ
+
+Resolved
+ OAuth configuration enablement
+
+Resolved
+ Redirect URL handling
+
+Resolved
+ RabbitMQ virtual host configuration
+
+Documented
+ AWS access is configured through IAM user cognito_user with access key, secret key, and proper least-privilege policy
+
+Source code
+Repository: ItorizonRandD/devops-sre
+
+Summary
+The Cognito Worker Service provides a strong production-oriented foundation for asynchronous Cognito automation on Kubernetes. It combines event-driven processing, secure RabbitMQ communication, Cognito provisioning, OAuth configuration, and Prometheus-based observability in a single worker service.
+
+Event-driven processing through RabbitMQ
+
+AWS Cognito automation for provisioning and user operations
+
+AWS access through IAM user cognito_user using access key, secret key, and a proper least-privilege IAM policy
+
+Dynamic OAuth callback, logout, and redirect configuration
+
+Secure RabbitMQ communication with TLS and virtual host support
+
+Kubernetes-native deployment model
+
+Operational observability through Prometheus metrics
+
+FAQ
+
+Why does the service use manual ACK?
+Manual acknowledgment ensures a message is confirmed only after processing completes successfully. This helps avoid losing work during transient failures.
+
+
+What queue names are used by default?
+The default inbound queue is cognito-request and the default outbound queue is cognito-response.
+
+
+How does the worker authenticate to AWS?
+The worker authenticates to AWS using one dedicated IAM user named cognito_user. The access key and secret key for this IAM user are stored in the Kubernetes Secret as AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. The user must have a proper least-privilege policy for the required Cognito operations.
+
+
+What endpoint is used for monitoring?
+The service exposes Prometheus-compatible metrics at /metrics on port 2112.
+
+
+How is the default redirect selected if it is not provided?
+The fallback behavior sets the default redirect to the first value in callbackUrls.
